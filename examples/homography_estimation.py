@@ -14,6 +14,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 from libs.easyaug import RandomGeoAug, GeoAugParam, RandomPhotoAug
 
+import cProfile
+import pstats
+import io
+
+pr = cProfile.Profile()
+
 FONT = cv2.FONT_HERSHEY_DUPLEX
 FONT_SZ = 0.5
 FONT_PT = (5, 15)
@@ -410,6 +416,8 @@ def run():
                 verbose2 = verbose
             else:
                 verbose2 = False
+
+            pr.enable()
             info = theseus_layer.forward(
                 inputs,
                 optimizer_kwargs={
@@ -419,6 +427,7 @@ def run():
                     "backward_mode": BACKWARD_MODE["implicit"],
                 },
             )
+            pr.disable()
             err_hist = info[1].err_history
             H_hist = theseus_layer.optimizer.state_history
             # print("Finished inner loop in %d iters" % len(H_hist))
@@ -431,8 +440,10 @@ def run():
                 H_1_2.reshape(-1, 3, 3), Hgt_1_2.reshape(-1, 3, 3), imgH, imgW
             )
             outer_loss = fc_dist.mean()
+            pr.enable()
             outer_loss.backward()
             outer_optim.step()
+            pr.disable()
             print(
                 "Epoch %d, iteration %d, outer_loss: %.3f"
                 % (epoch, itr, outer_loss.item())
@@ -447,6 +458,12 @@ def run():
                 torch.save({"itr": itr, "cnn_model": cnn_model}, save_path)
 
             itr += 1
+
+        s = io.StringIO()
+        sortby = pstats.SortKey.CUMULATIVE
+        ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+        ps.print_stats()
+        print(s.getvalue())
 
 
 def main():
