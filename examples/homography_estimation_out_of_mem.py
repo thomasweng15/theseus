@@ -614,6 +614,10 @@ for epoch in range(num_epochs):
 H = H8_1_2.clone().detach()
 H.requires_grad = False
 
+print("\n================================================")
+print("Without functorch")
+print("------------------------------------------------")
+
 
 def helper_jac_fn_no_functorch(H, feat1, feat2):
     def helper_err_fn(H):
@@ -627,6 +631,10 @@ ret = helper_jac_fn_no_functorch(H, feat1.data, feat2.data)
 print(
     f"GPU memory usage without functorch: {torch.cuda.max_memory_allocated() / 1048576}"
 )
+
+print("\n================================================")
+print("With functorch")
+print("------------------------------------------------")
 
 
 def helper_jac_fn_functorch_out_of_memory(H, feat1, feat2):
