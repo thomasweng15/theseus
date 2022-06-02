@@ -149,7 +149,7 @@ class SO3(LieGroup):
         if tangent_vector.ndim != 2 or tangent_vector.shape[1] != 3:
             raise ValueError("Tangent vectors of SO3 should be 3-D vectors.")
         ret = SO3(dtype=tangent_vector.dtype)
-        theta = torch.linalg.norm(tangent_vector, dim=1, keepdim=True).unsqueeze(1)
+        theta = torch.norm(tangent_vector, dim=1, keepdim=True).unsqueeze(1)
         theta2 = theta**2
         # Compute the approximations when theta ~ 0
         near_zero = theta < 0.005

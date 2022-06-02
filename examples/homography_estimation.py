@@ -1,14 +1,25 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+
+import hydra
+from hydra.utils import get_original_cwd
 import kornia
 from typing import List
 import glob
 import theseus as th
 import torch
-import torch.nn as nn
 from PIL import Image
 import cv2
 import numpy as np
 import os
+import time
 from torch.utils.data import DataLoader, Dataset
+import torch.nn as nn
+import torchvision.models as models
+import matplotlib.pyplot as plt
 import shutil
 from torch.utils.tensorboard import SummaryWriter
 
@@ -24,6 +35,7 @@ FONT = cv2.FONT_HERSHEY_DUPLEX
 FONT_SZ = 0.5
 FONT_PT = (5, 15)
 
+
 BACKWARD_MODE = {
     "implicit": th.BackwardMode.IMPLICIT,
     "full": th.BackwardMode.FULL,
@@ -31,14 +43,28 @@ BACKWARD_MODE = {
 }
 
 
+def clamp(x, xmin, xmax):
+    ret = torch.where(
+        x < xmin, xmin * torch.ones([1], dtype=x.dtype, device=x.device), x
+    )
+    ret = torch.where(
+        ret > xmax, xmax * torch.ones([1], dtype=x.dtype, device=x.device), ret
+    )
+    return ret
+
+
 def prepare_data():
-    dataset_root = os.path.join(os.getcwd(), "data")
+    dataset_root = os.path.join(get_original_cwd(), "data")
     chunks = [
         "revisitop1m.1",
         "revisitop1m.2",
         "revisitop1m.3",
         "revisitop1m.4",
         "revisitop1m.5",
+        # "revisitop1m.6",
+        # "revisitop1m.7",
+        # "revisitop1m.8",
+        # "revisitop1m.9",
     ]
     dataset_paths = []
     for chunk in chunks:
@@ -56,6 +82,22 @@ def prepare_data():
             print("Running command: ", cmd)
             os.system(cmd)
 
+    # bad_files = [
+    #     "/revisitop1m.9/171/1712c98e7f971fb9a272ad61c604ee2.jpg",
+    #     "/revisitop1m.9/176/176185b2431ac72f6419ab30bd78705c.jpg",
+    #     "/revisitop1m.9/162/162b144da5bf789a5e23feb1dfa6a391.jpg",
+    #     "/revisitop1m.9/173/1733685218bf22d514b9c3b4bf2c2027.jpg",
+    #     "/revisitop1m.9/158/1580dc2f3479ae44531a477f892850.jpg",
+    #     "/revisitop1m.9/16f/16f9772f0da348ee99cdf8f0e975d3.jpg",
+    #     "/revisitop1m.9/152/152f374b398b3ba3a1c843df036df.jpg",
+    #     "/revisitop1m.9/165/165f26d34914dbbab7bbdd3eac694333.jpg",
+    #     "/revisitop1m.9/174/17442dbe499594c7a54cca7bd171b58.jpg",
+    #     "/revisitop1m.9/16a/16acaf59321debe9250c0f6bc75e56d.jpg",
+    # ]
+    # for f in bad_files:
+    #     if os.path.exists(dataset_root + f):
+    #         os.remove(dataset_root + f)
+
     return dataset_paths
 
 
@@ -68,10 +110,10 @@ class HomographyDataset(Dataset):
             self.img_paths.extend(glob.glob(direc + "/**/*.jpg", recursive=True))
         assert len(self.img_paths) > 0, "no images found"
         print("Found %d total images in dataset" % len(self.img_paths))
-        sc = 0.1
+        sc = 0.3
         self.rga = RandomGeoAug(
             rotate_param=GeoAugParam(min=-30 * sc, max=30 * sc),
-            scale_param=GeoAugParam(min=(1.0 - 0.8 * sc), max=(1.0 + 1.2 * sc)),
+            scale_param=GeoAugParam(min=0.8 * (1.0 - sc), max=1.2 * (1.0 + sc)),
             translate_x_param=GeoAugParam(min=-0.2 * sc, max=0.2 * sc),
             translate_y_param=GeoAugParam(min=-0.2 * sc, max=0.2 * sc),
             shear_x_param=GeoAugParam(min=-10 * sc, max=10 * sc),
@@ -81,14 +123,11 @@ class HomographyDataset(Dataset):
         self.photo_aug = photo_aug
         if self.photo_aug:
             self.rpa = RandomPhotoAug()
-            prob = 0.2  # Probability of augmentation applied.
-            mag = 0.2  # Magnitude of augmentation [0: none, 1: max]
-            self.rpa.set_all_probs(prob)
-            self.rpa.set_all_mags(mag)
 
         # train test split
         self.img_paths.sort()
-        max_images = 99999
+        max_images = 500
+        # max_images = 99999
         self.img_paths = self.img_paths[:max_images]
         split_ix = int(0.9 * len(self.img_paths))
         if train:
@@ -107,9 +146,7 @@ class HomographyDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.img_paths[idx]
         img1 = np.asarray(Image.open(img_path).resize(size=(self.imgW, self.imgH)))
-        # Convert file to rgb if it is grayscale.
-        if img1.shape != (self.imgH, self.imgW, 3):
-            img1 = cv2.cvtColor(img1, cv2.COLOR_GRAY2RGB)
+        assert img1.shape == (self.imgH, self.imgW, 3)
         img1 = torch.from_numpy(img1.astype(np.float32) / 255.0).permute(2, 0, 1)[None]
         img2, H_1_2 = self.rga.forward(
             img1, return_transform=True, normalize_returned_transform=True
@@ -117,10 +154,14 @@ class HomographyDataset(Dataset):
 
         # apply random photometric augmentations
         if self.photo_aug:
-            img1 = torch.clamp(img1, 0.0, 1.0)
-            img2 = torch.clamp(img2, 0.0, 1.0)
-            img1 = self.rpa.forward(img1)
-            img2 = self.rpa.forward(img2)
+            seed1, seed2 = None, None
+            if self.train is False:
+                seed1 = idx
+                seed2 = idx + 1
+            img1 = clamp(img1, 0.0, 1.0)
+            img2 = clamp(img2, 0.0, 1.0)
+            img1 = self.rpa.forward(img1, seed=seed1)
+            img2 = self.rpa.forward(img2, seed=seed2)
 
         data = {"img1": img1[0], "img2": img2[0], "H_1_2": H_1_2[0]}
 
@@ -128,14 +169,12 @@ class HomographyDataset(Dataset):
 
 
 def grid_sample(image, optical):
-    """
-    Custom implementation for torch.nn.functional.grid_sample() to avoid this warning:
-    > "RuntimeError: derivative for aten::grid_sampler_2d_backward is not implemented"
-    """
     N, C, IH, IW = image.shape
     _, H, W, _ = optical.shape
+
     ix = optical[..., 0]
     iy = optical[..., 1]
+
     ix = ((ix + 1) / 2) * (IW - 1)
     iy = ((iy + 1) / 2) * (IH - 1)
     with torch.no_grad():
@@ -147,20 +186,27 @@ def grid_sample(image, optical):
         iy_sw = iy_nw + 1
         ix_se = ix_nw + 1
         iy_se = iy_nw + 1
+
     nw = (ix_se - ix) * (iy_se - iy)
     ne = (ix - ix_sw) * (iy_sw - iy)
     sw = (ix_ne - ix) * (iy - iy_ne)
     se = (ix - ix_nw) * (iy - iy_nw)
+
     with torch.no_grad():
-        torch.clamp(ix_nw, 0, IW - 1, out=ix_nw)
-        torch.clamp(iy_nw, 0, IH - 1, out=iy_nw)
-        torch.clamp(ix_ne, 0, IW - 1, out=ix_ne)
-        torch.clamp(iy_ne, 0, IH - 1, out=iy_ne)
-        torch.clamp(ix_sw, 0, IW - 1, out=ix_sw)
-        torch.clamp(iy_sw, 0, IH - 1, out=iy_sw)
-        torch.clamp(ix_se, 0, IW - 1, out=ix_se)
-        torch.clamp(iy_se, 0, IH - 1, out=iy_se)
+        ix_nw = clamp(ix_nw, 0, IW - 1)
+        iy_nw = clamp(iy_nw, 0, IH - 1)
+
+        ix_ne = clamp(ix_ne, 0, IW - 1)
+        iy_ne = clamp(iy_ne, 0, IH - 1)
+
+        ix_sw = clamp(ix_sw, 0, IW - 1)
+        iy_sw = clamp(iy_sw, 0, IH - 1)
+
+        ix_se = clamp(ix_se, 0, IW - 1)
+        iy_se = clamp(iy_se, 0, IH - 1)
+
     image = image.view(N, C, IH * IW)
+
     nw_val = torch.gather(
         image, 2, (iy_nw * IW + ix_nw).long().view(N, 1, H * W).repeat(1, C, 1)
     )
@@ -173,12 +219,14 @@ def grid_sample(image, optical):
     se_val = torch.gather(
         image, 2, (iy_se * IW + ix_se).long().view(N, 1, H * W).repeat(1, C, 1)
     )
+
     out_val = (
         nw_val.view(N, C, H, W) * nw.view(N, 1, H, W)
         + ne_val.view(N, C, H, W) * ne.view(N, 1, H, W)
         + sw_val.view(N, C, H, W) * sw.view(N, 1, H, W)
         + se_val.view(N, C, H, W) * se.view(N, 1, H, W)
     )
+
     return out_val
 
 
@@ -189,28 +237,46 @@ def warp_perspective_norm(H, img):
     )
     Hinv = torch.inverse(H)
     warped_grid = kornia.geometry.transform.homography_warper.warp_grid(grid, Hinv)
-    # grid_sample = torch.nn.functional.grid_sample
-    # img2 = grid_sample(img, warped_grid, mode="bilinear", align_corners=True)
-    # Using custom implementation, above will throw error with outer loop optim.
     img2 = grid_sample(img, warped_grid)
     return img2
 
 
-def homography_error_fn(optim_vars: List[th.Manifold], aux_vars: List[th.Variable]):
-    H8_1_2 = optim_vars[0].data.reshape(-1, 8)
-    # Force the last element H[2,2] to be 1.
-    H_1_2 = torch.cat([H8_1_2, H8_1_2.new_ones(H8_1_2.shape[0], 1)], dim=-1)  # type: ignore
+def homography_error_fn(
+    optim_vars: List[th.Manifold], aux_vars: List[th.Variable], pool_size: int
+):
+    H_1_2 = optim_vars[0]
     img1, img2 = aux_vars
-    img1_dst = warp_perspective_norm(H_1_2.reshape(-1, 3, 3), img1.data)
+
+    ones = torch.ones(H_1_2.shape[0], 1, device=H_1_2.device, dtype=H_1_2.dtype)
+    H_1_2_mat = torch.cat((H_1_2.data, ones), dim=1).reshape(-1, 3, 3)
+    img1_dst = warp_perspective_norm(H_1_2_mat, img1.data)
     loss = torch.nn.functional.mse_loss(img1_dst, img2.data, reduction="none")
-    ones = warp_perspective_norm(
-        H_1_2.data.reshape(-1, 3, 3), torch.ones_like(img1.data)
-    )
-    mask = ones > 0.9
-    loss = loss.view(loss.shape[0], -1)
-    mask = mask.view(loss.shape[0], -1)
-    loss = (loss * mask).sum(dim=1, keepdim=True) / mask.sum(dim=1, keepdim=True)
+    mask = warp_perspective_norm(H_1_2_mat, torch.ones_like(img1.data))
+    mask = mask > 0.9
+    loss = (loss * mask).mean(dim=1)
+    loss = torch.nn.functional.avg_pool2d(loss, pool_size, stride=pool_size)
+    loss = loss.reshape(loss.shape[0], -1)
     return loss
+
+
+def four_corner_dist(H_1_2, H_1_2_gt, height, width):
+    Hinv_gt = torch.inverse(H_1_2_gt)
+    Hinv = torch.inverse(H_1_2)
+    grid = kornia.utils.create_meshgrid(2, 2, device=Hinv.device)
+    warped_grid = kornia.geometry.transform.homography_warper.warp_grid(grid, Hinv)
+    warped_grid_gt = kornia.geometry.transform.homography_warper.warp_grid(
+        grid, Hinv_gt
+    )
+    warped_grid = (warped_grid + 1) / 2
+    warped_grid_gt = (warped_grid_gt + 1) / 2
+    warped_grid[..., 0] *= width
+    warped_grid[..., 1] *= height
+    warped_grid_gt[..., 0] *= width
+    warped_grid_gt[..., 1] *= height
+
+    dist = torch.square(torch.norm(warped_grid - warped_grid_gt, dim=-1))
+    dist = dist.mean(dim=-1).mean(dim=-1)
+    return dist, warped_grid, warped_grid_gt
 
 
 def put_text(img, text, top=True):
@@ -229,79 +295,379 @@ def torch2cv2(img):
     return out
 
 
-def viz_warp(path, img1, img2, img1_w, iteration, err=-1.0, fc_err=-1.0):
+def torch2cv2_border(img):
+    out = (img.permute(1, 2, 0) * 255.0).data.cpu().numpy().astype(np.uint8)[:, :, ::-1]
+    out = np.ascontiguousarray(out)
+    h, w = out.shape[:2]
+    blank = np.full([h * 2, w * 2, 3], 255).astype(np.uint8)
+    blank[int(h / 2) : int(3 * h / 2), int(w / 2) : int(3 * w / 2)] = out
+    return blank
+
+
+def viz_warp(path, img1, img2, img1_w, iteration, err):
     img_diff = torch2cv2(torch.abs(img1_w - img2))
     img1 = torch2cv2(img1)
     img2 = torch2cv2(img2)
     img1_w = torch2cv2(img1_w)
-    factor = 2
-    new_sz = int(factor * img1.shape[1]), int(factor * img1.shape[0])
-    img1 = cv2.resize(img1, new_sz, interpolation=cv2.INTER_NEAREST)
-    img1 = cv2.resize(img1, new_sz)
-    img2 = cv2.resize(img2, new_sz, interpolation=cv2.INTER_NEAREST)
-    img1_w = cv2.resize(img1_w, new_sz, interpolation=cv2.INTER_NEAREST)
-    img_diff = cv2.resize(img_diff, new_sz, interpolation=cv2.INTER_NEAREST)
     img1 = put_text(img1, "image I")
     img2 = put_text(img2, "image I'")
     img1_w = put_text(img1_w, "I warped to I'")
     img_diff = put_text(img_diff, "L2 diff")
     out = np.concatenate([img1, img2, img1_w, img_diff], axis=1)
-    out = put_text(
-        out,
-        "iter: %05d, loss: %.8f, fc_err: %.3f px" % (iteration, err, fc_err),
-        top=False,
-    )
+    out = put_text(out, "iter: %05d, loss: %.3f" % (iteration, err), top=False)
     cv2.imwrite(path, out)
 
 
-def write_gif_batch(log_dir, img1, img2, H_hist, Hgt_1_2, err_hist=None):
-    anim_dir = f"{log_dir}/animation"
-    os.makedirs(anim_dir, exist_ok=True)
-    subsample_anim = 1
-    for it in H_hist:
-        if it % subsample_anim != 0:
-            continue
-        # Visualize only first element in batch.
-        H8_1_2 = H_hist[it]["H8_1_2"].data
-        H_1_2 = torch.cat([H8_1_2, H8_1_2.new_ones(H8_1_2.shape[0], 1)], dim=-1)
-        H_1_2_mat = H_1_2[0].reshape(1, 3, 3)
-        Hgt_1_2_mat = Hgt_1_2[0].reshape(1, 3, 3)
-        imgH, imgW = img1.shape[-2], img1.shape[-1]
-        fc_err = four_corner_dist(H_1_2_mat, Hgt_1_2_mat, imgH, imgW)
-        if err_hist is None:
-            err = -1
-        else:
-            err = float(err_hist[0][it])
-        img1 = img1[0][None, ...]
-        img2 = img2[0][None, ...]
-        img1_dsts = warp_perspective_norm(H_1_2_mat, img1)
-        path = os.path.join(log_dir, f"{anim_dir}/{it:05d}.png")
-        viz_warp(path, img1[0], img2[0], img1_dsts[0], it, err=err, fc_err=fc_err)
-    anim_path = os.path.join(log_dir, "animation.gif")
-    cmd = f"convert -delay 10 -loop 0 {anim_dir}/*.png {anim_path}"
-    print("Generating gif here: %s" % anim_path)
-    os.system(cmd)
-    shutil.rmtree(anim_dir)
-    return
+def viz_four_corner(path, img1, img2, H_1_2_mat, warped_grid, warped_grid_gt):
+    h, w = img1.shape[1:]
+    img1_w = warp_perspective_norm(H_1_2_mat[None, ...], img1[None, ...])[0]
+    img_diff = torch2cv2_border(torch.abs(img1_w - img2))
+    img1 = torch2cv2_border(img1)
+    img2 = torch2cv2_border(img2)
+    img1_w = torch2cv2_border(img1_w)
+    img2 = put_text(img2, "image I'")
+    img1_w = put_text(img1_w, "I warped to I'")
+    img_diff = put_text(img_diff, "L2 diff")
 
+    src_grid = kornia.utils.create_meshgrid(2, 2, normalized_coordinates=False)[0]
+    src_grid[..., 0] *= w
+    src_grid[..., 1] *= h
+    offset = np.array([w / 2, h / 2]).astype(int)
+    for point in src_grid.reshape(-1, 2):
+        point = point.numpy().astype(int) + offset
+        cv2.circle(img1, point, 3, (0, 0, 255), thickness=-1)
+    for point in warped_grid.cpu().reshape(-1, 2):
+        point = point.numpy().astype(int) + offset
+        cv2.circle(img1, point, 3, (255, 0, 0), thickness=-1)
+    for point in warped_grid_gt.cpu().reshape(-1, 2):
+        point = point.numpy().astype(int) + offset
+        cv2.circle(img1, point, 3, (0, 255, 0), thickness=-1)
+    out = np.concatenate([img1, img2, img1_w, img_diff], axis=1)
 
-def four_corner_dist(H_1_2, H_1_2_gt, height, width):
-    Hinv_gt = torch.inverse(H_1_2_gt)
-    Hinv = torch.inverse(H_1_2)
-    grid = kornia.utils.create_meshgrid(2, 2, device=Hinv.device)
-    warped_grid = kornia.geometry.transform.homography_warper.warp_grid(grid, Hinv)
-    warped_grid_gt = kornia.geometry.transform.homography_warper.warp_grid(
-        grid, Hinv_gt
-    )
-    warped_grid = (warped_grid + 1) / 2
-    warped_grid_gt = (warped_grid_gt + 1) / 2
-    warped_grid[..., 0] *= width
-    warped_grid[..., 1] *= height
-    warped_grid_gt[..., 0] *= width
-    warped_grid_gt[..., 1] *= height
-    dist = torch.norm(warped_grid - warped_grid_gt, p=2, dim=-1)
+    dist = torch.norm(warped_grid - warped_grid_gt, dim=-1)
     dist = dist.mean(dim=-1).mean(dim=-1)
-    return dist
+    out = put_text(out, "four corner dist: %.3f" % (dist.item()))
+    cv2.imwrite(path, out)
+
+
+def four_corner_dist_hist(path, fcd_pho, fcd_fix, fcd_opt):
+    plt.figure()
+    plt.hist(
+        fcd_pho[fcd_pho < 1000], bins=50, label="Photometric", color="C0", alpha=0.5
+    )
+    plt.hist(
+        fcd_fix[fcd_fix < 1000],
+        bins=50,
+        label="Feature-metric fixed",
+        color="C1",
+        alpha=0.5,
+    )
+    plt.hist(
+        fcd_opt[fcd_opt < 1000],
+        bins=50,
+        label="Feature-metric optimized",
+        color="C2",
+        alpha=0.5,
+    )
+    plt.xlabel("Four corner distance (pixels)")
+    plt.ylabel("Count")
+    plt.legend()
+    plt.savefig(path)
+
+
+def four_corner_thresh(path, fcd_pho, fcd_fix, fcd_opt):
+    thresholds = np.arange(1, 401)
+    count_pho = [len(fcd_pho[fcd_pho < thr]) / len(fcd_pho) for thr in thresholds]
+    count_fix = [len(fcd_fix[fcd_fix < thr]) / len(fcd_fix) for thr in thresholds]
+    count_opt = [len(fcd_opt[fcd_opt < thr]) / len(fcd_opt) for thr in thresholds]
+    plt.figure()
+    plt.plot(thresholds, count_pho, label="Photometric", color="C0")
+    plt.plot(thresholds, count_fix, label="Feature-metric fixed", color="C1")
+    plt.plot(thresholds, count_opt, label="Feature-metric optimized", color="C2")
+    plt.xlabel("Threshold four corner distance (pixels)")
+    plt.ylabel("Proportion below threshold")
+    # plt.xscale('log')
+    plt.legend()
+    plt.savefig(path)
+
+
+def write_gif_batch(save_dir, state_history, img1, img2, loss, ix=0):
+    for it in state_history:
+        H = state_history[it]["H_1_2"].data
+        ones = torch.ones(H.shape[0], 1, device=H.device, dtype=H.dtype)
+        H_1_2_mat = torch.cat((H.data, ones), dim=1).reshape(-1, 3, 3)
+        img1_dsts = warp_perspective_norm(H_1_2_mat, img1)
+
+        for j, H in enumerate(H_1_2_mat):
+            if it == 0:
+                os.makedirs(f"{save_dir}/out{j:03d}")
+            path = os.path.join(save_dir, f"out{j:03d}/{it:05d}.png")
+            viz_warp(
+                path,
+                img1[j],
+                img2[j],
+                img1_dsts[j],
+                it,
+                loss[j].item(),
+            )
+
+    for j in range(len(H_1_2_mat)):
+        cmd = f"convert -delay 10 -loop 0 {save_dir}/out{j:03d}/*.png {save_dir}/img{ix:03d}.gif"
+        print(cmd)
+        os.system(cmd)
+        shutil.rmtree(f"{save_dir}/out{j:03d}")
+        ix += 1
+
+
+def setup_homgraphy_layer(cfg, device, batch_size, channels):
+
+    objective = th.Objective()
+
+    H_init = torch.zeros(batch_size, 8)
+    H_1_2 = th.Vector(data=H_init, name="H_1_2")
+
+    img_init = torch.zeros(batch_size, channels, cfg.imgH, cfg.imgW)
+    img1 = th.Variable(data=img_init, name="img1")
+    img2 = th.Variable(data=img_init, name="img2")
+
+    # loss is pooled so error dim is not too large
+    pool_size = int(cfg.imgH // 3)
+    pooled = torch.nn.functional.avg_pool2d(img_init, pool_size, stride=pool_size)
+    error_dim = pooled[0, 0].numel()
+    print(f"Pool size {pool_size}, error dim {error_dim}")
+
+    def error_fn(optim_vars: List[th.Manifold], aux_vars: List[th.Variable]):
+        return homography_error_fn(optim_vars, aux_vars, pool_size)
+
+    homography_cf = th.AutoDiffCostFunction(
+        optim_vars=[H_1_2],
+        err_fn=error_fn,
+        dim=error_dim,
+        aux_vars=[img1, img2],
+    )
+    objective.add(homography_cf)
+
+    reg_w = th.ScaleCostWeight(np.sqrt(cfg.inner_optim.reg_w))
+    reg_w.to(dtype=H_init.dtype)
+    H_identity = torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
+    identity_homography = th.Vector(data=H_identity, name="identity")
+    objective.add(
+        th.eb.VariableDifference(
+            H_1_2, reg_w, identity_homography, name="reg_homography"
+        )
+    )
+
+    optimizer = th.GaussNewton(
+        objective,
+        max_iterations=cfg.inner_optim.max_iters,
+        step_size=cfg.inner_optim.step_size,
+    )
+
+    theseus_layer = th.TheseusLayer(optimizer)
+    theseus_layer.to(device)
+
+    return theseus_layer
+
+
+def train_loop(cfg, device, train_dataset, feat_model, writer=None, train_chkpt=None):
+    if cfg.save_model:
+        os.makedirs("chkpts")
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=cfg.train_batch_size, shuffle=True
+    )
+    sample = next(iter(train_loader))
+    feat_channels = feat_model(sample["img1"].to(device)).shape[1]
+
+    model_optimizer = torch.optim.Adam(feat_model.parameters(), lr=cfg.outer_optim.lr)
+
+    start_epoch = 0
+    if train_chkpt is not None:
+        if os.path.exists(train_chkpt):
+            state_dict = torch.load(train_chkpt)
+            feat_model.load_state_dict(state_dict["model_state_dict"])
+            model_optimizer.load_state_dict(state_dict["optimizer_state_dict"])
+            start_epoch = state_dict["epoch"]
+            print("Loading from checkpoint ", cfg.train_chkpt)
+
+    l1_loss = torch.nn.L1Loss()
+
+    layer_feat = setup_homgraphy_layer(
+        cfg,
+        device,
+        cfg.train_batch_size,
+        feat_channels,
+    )
+
+    feat_model.train()
+
+    all_losses = []
+    epoch_losses = []
+    print(f"\n Starting training for {cfg.outer_optim.num_epochs - start_epoch} epochs")
+    for epoch in range(start_epoch, cfg.outer_optim.num_epochs):
+        running_losses = []
+        start_time = time.time()
+        for t, data in enumerate(train_loader):
+            start = time.time()
+
+            H_1_2_gt = data["H_1_2"].to(device)
+            img1 = data["img1"].to(device)
+            img2 = data["img2"].to(device)
+            feat1 = feat_model(img1)
+            feat2 = feat_model(img2)
+
+            H_init = torch.eye(3).reshape(1, 9).repeat(img1.shape[0], 1).to(device)
+            H_init = H_init[:, :-1]
+            inputs = {
+                "H_1_2": H_init,
+                "img1": feat1,
+                "img2": feat2,
+            }
+
+            pr.enable()
+            layer_feat.forward(
+                inputs,
+                optimizer_kwargs={
+                    "verbose": False,
+                    "backward_mode": BACKWARD_MODE[cfg.inner_optim.backward_mode],
+                    "__keep_final_step_size__": True,
+                },
+            )
+            pr.disable()
+
+            # no loss on last element as set to one
+            H_1_2_gt = H_1_2_gt.reshape(-1, 9)[:, :-1]
+            H_1_2 = layer_feat.objective.get_optim_var("H_1_2")
+            loss = l1_loss(H_1_2.data, H_1_2_gt)
+            model_optimizer.zero_grad()
+            pr.enable()
+            loss.backward()
+            model_optimizer.step()
+            pr.disable()
+            running_losses.append(loss.item())
+            all_losses.append(loss.item())
+
+            elapsed = time.time() - start
+            print(
+                f"Step {t} / {len(train_loader)}. Loss {loss.item():.4f}. Time {elapsed}."
+            )
+            if writer is not None:
+                writer.add_scalar("Loss/train", loss.item(), t)
+
+            if t % 200 == 0 and cfg.save_model:
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": feat_model.state_dict(),
+                        "optimizer_state_dict": model_optimizer.state_dict(),
+                    },
+                    f"chkpts/epoch_{epoch:03d}_step_{t:03d}.pt",
+                )
+
+        epoch_time = time.time() - start_time
+        epoch_loss = np.mean(running_losses).item()
+        epoch_losses.append(epoch_loss)
+        print(
+            f"******* Epoch {epoch}. Average loss: {epoch_loss:.4f}. "
+            f"Epoch time {epoch_time}*******"
+        )
+
+        s = io.StringIO()
+        sortby = pstats.SortKey.CUMULATIVE
+        ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+        ps.print_stats()
+        print(s.getvalue())
+
+    return feat_model
+
+
+def run_eval(cfg, device, test_dataset, save_dir=None, feat_model=None):
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+
+    test_loader = DataLoader(
+        test_dataset, batch_size=cfg.test_batch_size, shuffle=False
+    )
+    channels = 3
+    if feat_model is not None:
+        sample = next(iter(test_loader))
+        channels = feat_model(sample["img1"].to(device)).shape[1]
+
+    theseus_layer = setup_homgraphy_layer(
+        cfg,
+        device,
+        cfg.test_batch_size,
+        channels,
+    )
+    theseus_layer.optimizer.params.max_iterations = cfg.test_max_iters
+
+    if feat_model is not None:
+        feat_model.eval()
+
+    ix = 0
+    with torch.no_grad():
+        losses = []
+        four_corner_dists = []
+        for t, data in enumerate(test_loader):
+
+            H_1_2_gt = data["H_1_2"].to(device)
+            img1 = data["img1"].to(device)
+            img2 = data["img2"].to(device)
+            H_init = torch.eye(3).reshape(1, 9).repeat(img1.shape[0], 1).to(device)
+            H_init = H_init[:, :-1]
+
+            inputs = {
+                "H_1_2": H_init,
+                "img1": img1,
+                "img2": img2,
+            }
+
+            if feat_model is not None:
+                inputs["img1"] = feat_model(img1)
+                inputs["img2"] = feat_model(img2)
+
+            info = theseus_layer.forward(inputs, {"verbose": False})
+            H_1_2 = info[0]["H_1_2"]
+
+            # Compute evalution metric, for now photometric loss
+            img1_var = th.Variable(data=img1, name="img1")
+            img2_var = th.Variable(data=img2, name="img2")
+
+            ones = torch.ones(H_1_2.shape[0], 1, device=H_1_2.device, dtype=H_1_2.dtype)
+            H_1_2_mat = torch.cat((H_1_2, ones), dim=1).reshape(-1, 3, 3)
+            dist, warped_grid, warped_grid_gt = four_corner_dist(
+                H_1_2_mat, H_1_2_gt, cfg.imgH, cfg.imgW
+            )
+            four_corner_dists.extend(dist.tolist())
+
+            loss = homography_error_fn([H_1_2], [img1_var, img2_var], pool_size=1)
+            loss = loss.mean(dim=1)
+            losses.extend(loss.tolist())
+
+            print(f"Test loss ({t} / {len(test_loader)}): {loss.mean().item()}")
+
+            if cfg.save_gifs and ix < 20:
+                write_gif_batch(
+                    save_dir,
+                    theseus_layer.optimizer.state_history,
+                    img1,
+                    img2,
+                    loss,
+                    ix,
+                )
+                for i in range(cfg.test_batch_size):
+                    save_file = f"{save_dir}/loss{ix:03d}.png"
+                    viz_four_corner(
+                        save_file,
+                        img1[i],
+                        img2[i],
+                        H_1_2_mat[i],
+                        warped_grid[i],
+                        warped_grid_gt[i],
+                    )
+                    ix += 1
+
+        return np.array(losses), np.array(four_corner_dists)
 
 
 class SimpleCNN(nn.Module):
@@ -310,166 +676,107 @@ class SimpleCNN(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.conv1 = nn.Conv2d(3, D, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(D, 3, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(D)
+        self.bn1 = nn.BatchNorm2d(3)
 
     def forward(self, img):
         x = self.relu(self.bn1(self.conv1(img)))
         return self.conv2(x)
 
 
-def run():
-
-    batch_size = 64
-    max_iterations = 50
-    step_size = 0.1
-    verbose = True
-    imgH, imgW = 60, 80
-    use_gpu = True
-    viz_every = 10
-    disp_every = 10
-    save_every = 100
-    num_epochs = 999
-    outer_lr = 1e-4
-    use_cnn = True
-
-    log_dir = os.path.join(os.getcwd(), "viz")
-    os.makedirs(log_dir, exist_ok=True)
-    print("Writing to tensorboard at", os.getcwd())
-    writer = SummaryWriter(log_dir)
-
-    device = "cuda" if torch.cuda.is_available() and use_gpu else "cpu"
+def run(cfg):
 
     dataset_paths = prepare_data()
-    dataset = HomographyDataset(dataset_paths, imgH, imgW)
-    dataloader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, drop_last=True
+
+    train_dataset = HomographyDataset(dataset_paths, cfg.imgH, cfg.imgW, train=True)
+    test_dataset = HomographyDataset(dataset_paths, cfg.imgH, cfg.imgW, train=False)
+
+    log_dir = "viz"
+    os.makedirs(log_dir, exist_ok=True)
+    print("Writing to tensorboard at", os.getcwd())
+    writer = SummaryWriter(os.getcwd())
+
+    device = "cuda" if torch.cuda.is_available() and cfg.use_gpu else "cpu"
+    print("Using device %s" % device)
+
+    net = models.resnet18(pretrained=True)
+    net.to(device)
+    upsample = torch.nn.UpsamplingBilinear2d(size=[cfg.imgH, cfg.imgW])
+    net_feat = torch.nn.Sequential(*list(net.children())[:-4] + [upsample])
+    fixed_feat = torch.nn.Sequential(*list(net.children())[:-4] + [upsample])
+    # A simple 2-layer CNN network that maintains the original image size.
+    # net = SimpleCNN()
+    # net.to(device)
+    # net_feat = torch.nn.Sequential(*list(net.children()))
+    # fixed_feat = torch.nn.Sequential(*list(net.children()))
+
+    # Training loop to refine pretrained features
+    net_feat = train_loop(
+        cfg,
+        device,
+        train_dataset,
+        net_feat,
+        writer=writer,
+        train_chkpt=cfg.train_chkpt,
     )
 
-    # A simple 2-layer CNN network that maintains the original image size.
-    cnn_model = SimpleCNN()
-    cnn_model.to(device)
+    # Test loop
+    res_dir = "res"
+    os.makedirs(res_dir)
 
-    # Set up outer loop optimization.
-    outer_optim = torch.optim.Adam(cnn_model.parameters(), lr=outer_lr)
+    loss_pho, fcd_pho = run_eval(cfg, device, test_dataset, save_dir=log_dir + "/pho")
+    np.savetxt(f"{res_dir}/loss_pho.txt", loss_pho)
+    np.savetxt(f"{res_dir}/fcd_pho.txt", fcd_pho)
+    # loss_pho = np.loadtxt(get_original_cwd() + "/outputs/homography_res/loss_pho.txt")
+    # fcd_pho = np.loadtxt(get_original_cwd() + "/outputs/homography_res/fcd_pho.txt")
 
-    itr = 0
+    loss_fix, fcd_fix = run_eval(
+        cfg,
+        device,
+        test_dataset,
+        save_dir=log_dir + "/feat_fix",
+        feat_model=fixed_feat,
+    )
+    np.savetxt(f"{res_dir}/loss_fix.txt", loss_fix)
+    np.savetxt(f"{res_dir}/fcd_fix.txt", fcd_fix)
+    # loss_fix = np.loadtxt(get_original_cwd() + "/outputs/homography_res/loss_fix.txt")
+    # fcd_fix = np.loadtxt(get_original_cwd() + "/outputs/homography_res/fcd_fix.txt")
 
-    for epoch in range(num_epochs):
+    # print("Loading eval model from checkpoint ", cfg.train_chkpt)
+    # net_feat.load_state_dict(torch.load(cfg.eval_chkpt)["model_state_dict"])
+    loss_opt, fcd_opt = run_eval(
+        cfg,
+        device,
+        test_dataset,
+        save_dir=log_dir + "/feat_opt",
+        feat_model=net_feat,
+    )
+    np.savetxt(f"{res_dir}/loss_opt.txt", loss_opt)
+    np.savetxt(f"{res_dir}/fcd_opt.txt", fcd_opt)
+    # loss_opt = np.loadtxt(get_original_cwd() + "/outputs/homography_res/loss_opt.txt")
+    # fcd_opt = np.loadtxt(get_original_cwd() + "/outputs/homography_res/fcd_opt.txt")
 
-        for _, data in enumerate(dataloader):
+    # print("\n\nResults ---------------------------------------")
+    # print("\nMean and median photometric loss over the test dataset:")
+    # print(f"Photometric: {np.mean(loss_pho):.3f}, {np.median(loss_pho):.3f}")
+    # print(f"Feature-metric fixed: {np.mean(loss_fix):.3f}, {np.median(loss_fix):.3f}")
+    # print(f"Feature-metric optimised: {np.mean(loss_opt):.3f}, {np.median(loss_opt):.3f}")
 
-            outer_optim.zero_grad()
+    # print("\nMean and median four corner distance over the test dataset (pixels):")
+    # print(f"Photometric: {np.mean(fcd_pho):.3f}, {np.median(fcd_pho):.3f}")
+    # print(f"Feature-metric fixed: {np.mean(fcd_fix):.3f}, {np.median(fcd_fix):.3f}")
+    # print(f"Feature-metric optimised: {np.mean(fcd_opt):.3f}, {np.median(fcd_opt):.3f}")
 
-            img1 = data["img1"].to(device)
-            img2 = data["img2"].to(device)
-            Hgt_1_2 = data["H_1_2"].to(device)
-
-            objective = th.Objective()
-
-            H8_init = torch.eye(3).reshape(1, 9)[:, :-1].repeat(batch_size, 1)
-            H8_1_2 = th.Vector(data=H8_init, name="H8_1_2")
-
-            if use_cnn:  # Use cnn features.
-                feat1 = cnn_model.forward(img1)
-                feat2 = cnn_model.forward(img2)
-            else:  # Use image pixels.
-                feat1 = img1
-                feat2 = img2
-
-            feat1 = th.Variable(data=feat1, name="feat1")
-            feat2 = th.Variable(data=feat2, name="feat2")
-
-            # Set up inner loop optimization.
-            homography_cf = th.AutoDiffCostFunction(
-                optim_vars=[H8_1_2],
-                err_fn=homography_error_fn,
-                dim=1,
-                aux_vars=[feat1, feat2],
-            )
-            objective.add(homography_cf)
-
-            # Regularization helps avoid crash with using implicit mode.
-            reg_w = 1e-2
-            reg_w = th.ScaleCostWeight(np.sqrt(reg_w))
-            reg_w.to(dtype=H8_init.dtype)
-            vals = torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
-            H8_1_2_id = th.Vector(data=vals, name="identity")
-            reg_cf = th.eb.VariableDifference(
-                H8_1_2, reg_w, H8_1_2_id, name="reg_homography"
-            )
-            objective.add(reg_cf)
-
-            inner_optim = th.LevenbergMarquardt(
-                objective,
-                max_iterations=max_iterations,
-                step_size=step_size,
-            )
-            theseus_layer = th.TheseusLayer(inner_optim)
-            theseus_layer.to(device)
-
-            inputs = {
-                "H8_1_2": H8_1_2.data,
-                "feat1": feat1.data,
-                "feat2": feat2.data,
-            }
-            if itr % disp_every == 0:
-                verbose2 = verbose
-            else:
-                verbose2 = False
-
-            pr.enable()
-            info = theseus_layer.forward(
-                inputs,
-                optimizer_kwargs={
-                    "verbose": verbose2,
-                    "track_err_history": True,
-                    # "backward_mode": BACKWARD_MODE["full"]})
-                    "backward_mode": BACKWARD_MODE["implicit"],
-                },
-            )
-            pr.disable()
-            err_hist = info[1].err_history
-            H_hist = theseus_layer.optimizer.state_history
-            # print("Finished inner loop in %d iters" % len(H_hist))
-
-            Hgt_1_2 = Hgt_1_2.reshape(-1, 9)
-            H8_1_2 = theseus_layer.objective.get_optim_var("H8_1_2").data.reshape(-1, 8)
-            H_1_2 = torch.cat([H8_1_2, H8_1_2.new_ones(H8_1_2.shape[0], 1)], dim=-1)
-            # Loss is on four corner error.
-            fc_dist = four_corner_dist(
-                H_1_2.reshape(-1, 3, 3), Hgt_1_2.reshape(-1, 3, 3), imgH, imgW
-            )
-            outer_loss = fc_dist.mean()
-            pr.enable()
-            outer_loss.backward()
-            outer_optim.step()
-            pr.disable()
-            print(
-                "Epoch %d, iteration %d, outer_loss: %.3f"
-                % (epoch, itr, outer_loss.item())
-            )
-            writer.add_scalar("Loss/train", outer_loss.item(), itr)
-
-            if itr % viz_every == 0:
-                write_gif_batch(log_dir, feat1, feat2, H_hist, Hgt_1_2, err_hist)
-
-            if itr % save_every == 0:
-                save_path = os.path.join(log_dir, "last.ckpt")
-                torch.save({"itr": itr, "cnn_model": cnn_model}, save_path)
-
-            itr += 1
-
-        s = io.StringIO()
-        sortby = pstats.SortKey.CUMULATIVE
-        ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-        ps.print_stats()
-        print(s.getvalue())
+    # # four corner plots
+    # plot_path = get_original_cwd() + "/outputs/homography_res/"
+    # four_corner_dist_hist(plot_path + "fcd_hist.png", fcd_pho, fcd_fix, fcd_opt)
+    # four_corner_thresh(plot_path + "fcd_threshold.png", fcd_pho, fcd_fix, fcd_opt)
 
 
-def main():
-    run()
+@hydra.main(config_path="./configs/", config_name="homography_estimation")
+def main(cfg):
+    torch.manual_seed(cfg.seed)
+    run(cfg)
 
 
 if __name__ == "__main__":
-    torch.manual_seed(0)
     main()
