@@ -622,9 +622,13 @@ print("------------------------------------------------")
 
 def helper_jac_fn_no_functorch(H, feat1, feat2):
     def helper_err_fn(H):
-        return homography_error_fn([th.Vector(data=H.unsqueeze(0))],
-                                   [th.Variable(data=feat1.unsqueeze(0).detach()),
-                                    th.Variable(data=feat2.unsqueeze(0).detach())])
+        return homography_error_fn(
+            [th.Vector(data=H.unsqueeze(0))],
+            [
+                th.Variable(data=feat1.unsqueeze(0).detach()),
+                th.Variable(data=feat2.unsqueeze(0).detach()),
+            ],
+        )
 
     return torch.autograd.functional.jacobian(helper_err_fn, H)
 
@@ -639,9 +643,10 @@ print("------------------------------------------------")
 
 def helper_jac_fn_functorch(H, feat1, feat2):
     def helper_err_fn(H):
-        return homography_error_fn([th.Vector(data=H.unsqueeze(0))],
-                                   [feat1.unsqueeze(0).detach(),
-                                    feat2.unsqueeze(0).detach()])
+        return homography_error_fn(
+            [th.Vector(data=H.unsqueeze(0))],
+            [feat1.unsqueeze(0).detach(), feat2.unsqueeze(0).detach()],
+        )
 
     return jacrev(helper_err_fn)(H)
 
