@@ -27,7 +27,7 @@ version = (root_dir / "version.txt").read_text().strip()
 with open("README.md", "r") as fh:
     long_description = fh.read()
 
-if "CUDA_HOME" in os.environ:
+if True: # "CUDA_HOME" in os.environ:
     ext_modules = [
         torch_cpp_ext.CUDAExtension(
             name="theseus.extlib.mat_mult", sources=["theseus/extlib/mat_mult.cu"]
