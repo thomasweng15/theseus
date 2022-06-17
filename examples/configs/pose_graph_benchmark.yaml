@@ -1,4 +1,4 @@
-dataset: rim
+dataset: sphere2500
 hydra:
   run:
     dir: /private/home/taoshaf/Documents/theseus/examples/outputs/pose_graph_benchmark

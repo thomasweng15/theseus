@@ -6,8 +6,12 @@
 import torch
 import theseus as th
 import theseus.utils.examples as theg
+import logging
 import hydra
 from scipy.io import savemat
+
+# Logger
+log = logging.getLogger(__name__)
 
 
 @hydra.main(config_path="./configs/", config_name="pose_graph_benchmark")
@@ -59,9 +63,21 @@ def main(cfg):
         linear_solver_cls=th.CholmodSparseSolver,
     )
 
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
     inputs = {var.name: var.data for var in verts}
     optimizer.objective.update(inputs)
+    start_event.record()
+    torch.cuda.reset_peak_memory_stats()
     optimizer.optimize(verbose=True)
+    end_event.record()
+
+    torch.cuda.synchronize()
+    forward_time = start_event.elapsed_time(end_event)
+    forward_mem = torch.cuda.max_memory_allocated() / 1048576
+    log.info(f"Forward pass took {forward_time} ms.")
+    log.info(f"Forward pass used {forward_mem} MBs.")
 
     results = {}
     results["objective"] = objective.function_value().detach().cpu().numpy().sum() / 2
