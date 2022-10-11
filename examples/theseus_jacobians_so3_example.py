@@ -14,6 +14,44 @@ log = []
 np.set_printoptions(precision=3)
 
 
+# ---------------------------------
+# Basic Lie Groups usage
+# ---------------------------------
+batch_size = 10
+v1 = torch.randn(batch_size, 3)
+v2 = torch.randn_like(v1)
+
+# Running operators
+x = th.SO3.exp_map(v1).log_map()
+y = th.SO3.exp_map(v1).compose(th.SO3.exp_map(v2))
+
+# If need jacobians for optimization,
+# need to either use AutodiffCostFunction as illustrated below
+# or compose analytic jacobians, for example
+Jlog = []
+Jexp = []
+x = th.SO3.exp_map(v1, jacobians=Jexp).log_map(jacobians=Jlog)
+J = Jlog[0].matmul(Jexp[0])
+
+# Side note: our jacobians follow the right trivialized
+# tangent deriviative and its inverse.
+# See https://asco.lcsr.jhu.edu/papers/KoMa2010.pdf
+
+# Note that by default our operations run checks to see
+# that new group objects satisfy det(R)=1, R^T@R=I. These
+# are time consuming and can be turned off as follows
+from theseus.geometry.lie_group_check import no_lie_group_check
+
+with no_lie_group_check():
+    x = th.SO3.exp_map(v1)
+
+# -------------------------------------------------------------------- #
+# -------------------------------------------------------------------- #
+# BELOW THIS POINT IS THE ORIGINAL SCRIPT WE SENT
+# -------------------------------------------------------------------- #
+# -------------------------------------------------------------------- #
+
+
 def test_theseus_jacobian(batch_size, method="analytic"):
     torch.cuda.empty_cache()
     try:  # this fails for CPU, just ignore
