@@ -79,6 +79,7 @@ from .optimizer.nonlinear import (  # usort: skip
     BackwardMode,
     GaussNewton,
     DCem,
+    DCemSolver,
     LevenbergMarquardt,
     NonlinearLeastSquares,
     NonlinearOptimizerInfo,
