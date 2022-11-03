@@ -37,8 +37,8 @@ class IdentityModel(KinematicsModel):
 
 
 class UrdfRobotModel(KinematicsModel):
-    def __init__(self, urdf_path: str):
-        self.drm_model = drm.DifferentiableRobotModel(urdf_path)
+    def __init__(self, urdf_path: str, device: str):
+        self.drm_model = drm.DifferentiableRobotModel(urdf_path, device=device)
 
     def _postprocess_quaternion(self, quat):
         # Convert quaternion convention (DRM uses xyzw, Theseus uses wxyz)
